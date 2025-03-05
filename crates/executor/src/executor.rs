@@ -103,10 +103,12 @@ pub enum ExecutionError {
     HaltWithNonZeroExitCode(u32),
 
     /// The execution failed with an invalid memory access.
+    /// The execution failed due to insufficient input data.
     #[error("invalid memory access for opcode {0} and address {1}")]
     InvalidMemoryAccess(Opcode, u32),
 
     /// The execution failed with an unimplemented syscall.
+    /// The execution failed due to an invalid syscall usage in unconstrained mode.
     #[error("unimplemented syscall {0}")]
     UnsupportedSyscall(u32),
 
