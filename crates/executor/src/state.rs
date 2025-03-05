@@ -547,10 +547,16 @@ const MAX_LOOP_SIZE: usize = 64;
 const PATTERN_THRESHOLD: usize = 3;
 const LOOP_CONFIDENCE_THRESHOLD: usize = 3;
 
+const MAX_UNROLL_FACTOR: usize = 8;
+const MIN_ITERATIONS_FOR_UNROLL: u32 = 4;
+const VECTORIZATION_THRESHOLD: usize = 4;
+
 #[derive(Debug, Clone)]
 struct LoopTracker {
     history: VecDeque<u32>,              // Recent PC values
     loops: HashMap<u32, LoopInfo>,       // Detected loops by start PC
+    active_loop: Option<ActiveLoop>,     // Currently executing loop
+    stats: LoopStats,                    // Loop execution statistics
 }
 
 #[derive(Debug, Clone)]
@@ -560,6 +566,55 @@ struct LoopInfo {
     body_size: usize,     // Number of instructions in loop
     iteration_count: u32, // Number of times loop has executed
     confidence: usize,    // Confidence in loop detection
+    unroll_factor: usize, // Current unroll factor
+    vectorizable: bool,   // Whether loop can be vectorized
+    induction_vars: HashSet<Register>, // Loop induction variables
+    memory_deps: Vec<MemoryDependence>, // Memory dependencies in loop
+    register_deps: Vec<RegisterDependence>, // Register dependencies in loop
+}
+
+#[derive(Debug, Clone)]
+struct ActiveLoop {
+    info: LoopInfo,
+    current_iteration: u32,
+    unrolled_iterations: usize,
+    vectorized: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryDependence {
+    base_addr: u32,
+    stride: i32,
+    access_type: AccessType,
+}
+
+#[derive(Debug, Clone)]
+struct RegisterDependence {
+    reg: Register,
+    dep_type: DependenceType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum AccessType {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum DependenceType {
+    Flow,    // Read after write
+    Anti,    // Write after read
+    Output,  // Write after write
+}
+
+#[derive(Debug, Clone, Default)]
+struct LoopStats {
+    total_loops: usize,
+    unrolled_loops: usize,
+    vectorized_loops: usize,
+    total_iterations: u64,
+    unrolled_iterations: u64,
+    vectorized_iterations: u64,
 }
 
 impl Default for LoopTracker {
@@ -567,6 +622,8 @@ impl Default for LoopTracker {
         Self {
             history: VecDeque::with_capacity(LOOP_HISTORY_SIZE),
             loops: HashMap::new(),
+            active_loop: None,
+            stats: LoopStats::default(),
         }
     }
 }
@@ -579,27 +636,58 @@ impl LoopTracker {
         }
         self.history.push_back(pc);
 
-        // Try to detect loops
+        // Update active loop if any
+        if let Some(ref mut active) = self.active_loop {
+            if pc == active.info.end_pc {
+                active.current_iteration += 1;
+                self.stats.total_iterations += 1;
+                if active.vectorized {
+                    self.stats.vectorized_iterations += 1;
+                }
+                if active.unrolled_iterations > 0 {
+                    self.stats.unrolled_iterations += 1;
+                }
+            }
+        }
+
+        // Try to detect new loops
         if self.history.len() >= MIN_LOOP_SIZE {
             for size in MIN_LOOP_SIZE..=MAX_LOOP_SIZE.min(self.history.len()) {
                 if self.check_loop_pattern(size) {
                     let start_pc = *self.history.get(self.history.len() - size).unwrap();
                     let end_pc = *self.history.back().unwrap();
                     
-                    self.loops.entry(start_pc)
+                    let loop_entry = self.loops.entry(start_pc)
                         .and_modify(|l| {
                             if l.body_size == size {
                                 l.confidence += 1;
                                 l.iteration_count += 1;
+                                // Adjust unroll factor based on execution history
+                                if l.iteration_count >= MIN_ITERATIONS_FOR_UNROLL {
+                                    l.unroll_factor = self.calculate_unroll_factor(l);
+                                }
                             }
                         })
-                        .or_insert(LoopInfo {
-                            start_pc,
-                            end_pc,
-                            body_size: size,
-                            iteration_count: 1,
-                            confidence: 1,
+                        .or_insert_with(|| {
+                            self.stats.total_loops += 1;
+                            LoopInfo {
+                                start_pc,
+                                end_pc,
+                                body_size: size,
+                                iteration_count: 1,
+                                confidence: 1,
+                                unroll_factor: 1,
+                                vectorizable: false,
+                                induction_vars: HashSet::new(),
+                                memory_deps: Vec::new(),
+                                register_deps: Vec::new(),
+                            }
                         });
+
+                    // Analyze loop for optimization opportunities
+                    if loop_entry.get().confidence >= LOOP_CONFIDENCE_THRESHOLD {
+                        self.analyze_loop(loop_entry.get_mut());
+                    }
                 }
             }
         }
@@ -615,8 +703,78 @@ impl LoopTracker {
         pattern == prev_pattern
     }
 
+    fn analyze_loop(&mut self, loop_info: &mut LoopInfo) {
+        // Analyze memory access patterns
+        self.analyze_memory_deps(loop_info);
+        
+        // Analyze register dependencies
+        self.analyze_register_deps(loop_info);
+        
+        // Check vectorization potential
+        loop_info.vectorizable = self.check_vectorizable(loop_info);
+        
+        // Update statistics
+        if loop_info.unroll_factor > 1 {
+            self.stats.unrolled_loops += 1;
+        }
+        if loop_info.vectorizable {
+            self.stats.vectorized_loops += 1;
+        }
+    }
+
+    fn analyze_memory_deps(&self, loop_info: &mut LoopInfo) {
+        loop_info.memory_deps.clear();
+        // Analyze memory access patterns within the loop
+        // Add memory dependencies with their strides and types
+    }
+
+    fn analyze_register_deps(&self, loop_info: &mut LoopInfo) {
+        loop_info.register_deps.clear();
+        // Analyze register dependencies within the loop
+        // Identify induction variables and dependency types
+    }
+
+    fn check_vectorizable(&self, loop_info: &LoopInfo) -> bool {
+        // Check if loop can be vectorized:
+        // 1. No cross-iteration dependencies
+        // 2. Regular memory access patterns
+        // 3. Sufficient number of iterations
+        // 4. Supported operations
+        loop_info.body_size >= VECTORIZATION_THRESHOLD &&
+            !loop_info.memory_deps.iter().any(|dep| dep.stride != 4) &&
+            !loop_info.register_deps.iter().any(|dep| dep.dep_type != DependenceType::Flow)
+    }
+
+    fn calculate_unroll_factor(&self, loop_info: &LoopInfo) -> usize {
+        // Calculate optimal unroll factor based on:
+        // 1. Loop size
+        // 2. Register pressure
+        // 3. Memory access patterns
+        // 4. Historical performance
+        let base_factor = (MAX_UNROLL_FACTOR / loop_info.body_size).max(1);
+        let reg_limit = 32 / loop_info.induction_vars.len().max(1);
+        base_factor.min(reg_limit).min(MAX_UNROLL_FACTOR)
+    }
+
     fn get_loop_info(&self, pc: u32) -> Option<&LoopInfo> {
         self.loops.get(&pc).filter(|l| l.confidence >= LOOP_CONFIDENCE_THRESHOLD)
+    }
+
+    fn start_loop(&mut self, loop_info: LoopInfo) {
+        self.active_loop = Some(ActiveLoop {
+            info: loop_info.clone(),
+            current_iteration: 0,
+            unrolled_iterations: loop_info.unroll_factor,
+            vectorized: loop_info.vectorizable,
+        });
+    }
+
+    fn end_loop(&mut self) {
+        self.active_loop = None;
+    }
+
+    fn get_stats(&self) -> &LoopStats {
+        &self.stats
     }
 }
 

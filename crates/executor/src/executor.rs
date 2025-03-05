@@ -1090,53 +1090,35 @@ impl<'a> Executor<'a> {
         #[cfg(debug_assertions)]
         self.log(&instruction);
 
-        // Check for loop optimization opportunity
+        // Check for loop optimization opportunities
         if let Some(loop_info) = self.state.loop_tracker.get_loop_info(current_pc) {
-            // Only optimize if we're at loop start and the loop body is safe to optimize
-            let mut can_optimize = true;
-            let mut temp_pc = current_pc;
-            
-            // Verify all instructions in loop are safe to optimize
-            for _ in 0..loop_info.body_size {
-                let idx = ((temp_pc - self.program.pc_base) / 4) as usize;
-                if idx >= self.program.instructions.len() {
-                    can_optimize = false;
-                    break;
-                }
-                let inst = self.program.instructions[idx];
+            if current_pc == loop_info.start_pc {
+                // Start new loop execution
+                self.state.loop_tracker.start_loop(loop_info.clone());
                 
-                if !matches!(inst.opcode, 
-                    Opcode::ADD | Opcode::SUB | Opcode::XOR | Opcode::OR | Opcode::AND |
-                    Opcode::SLL | Opcode::SRL | Opcode::SRA | Opcode::MUL) {
-                    can_optimize = false;
-                    break;
-                }
-                temp_pc = temp_pc.wrapping_add(4);
-            }
-
-            if can_optimize {
-                // Execute multiple iterations of the loop body
-                let iterations = 4.min(loop_info.iteration_count);
-                for _ in 0..iterations {
-                    temp_pc = current_pc;
-                    for _ in 0..loop_info.body_size {
-                        let idx = ((temp_pc - self.program.pc_base) / 4) as usize;
-                        let inst = self.program.instructions[idx];
-                        if let Err(e) = self.execute_instruction(&inst) {
-                            return Err(e);
-                        }
-                        temp_pc = temp_pc.wrapping_add(4);
+                if loop_info.vectorizable {
+                    // Execute vectorized loop
+                    if let Ok(()) = self.execute_vectorized_loop(&loop_info) {
+                        return Ok(false);
+                    }
+                } else if loop_info.unroll_factor > 1 {
+                    // Execute unrolled loop
+                    if let Ok(()) = self.execute_unrolled_loop(&loop_info) {
+                        return Ok(false);
                     }
                 }
-                self.state.pc = temp_pc;
-                self.state.global_clk += iterations as u64;
-                return Ok(false);
+            } else if current_pc == loop_info.end_pc {
+                // End of loop iteration
+                self.state.loop_tracker.end_loop();
             }
         }
 
-        // Normal execution path
+        // Execute single instruction
         self.execute_instruction(&instruction)?;
         self.state.global_clk += 1;
+
+        // Record instruction for loop analysis
+        self.state.loop_tracker.record_pc(self.state.pc);
 
         // Check cycle limit
         if let Some(max_cycles) = self.max_cycles {
